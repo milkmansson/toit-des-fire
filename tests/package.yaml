@@ -1,0 +1,7 @@
+dependencies:
+  des-fire:
+    path: ..
+  nfc:
+    path: ../../toit-nfc
+  des:
+    path: ../../toit-des

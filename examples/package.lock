@@ -1,0 +1,12 @@
+prefixes:
+  des-fire: toit-des-fire
+packages:
+  toit-des:
+    path: ../../toit-des
+  toit-des-fire:
+    path: ..
+    prefixes:
+      des: toit-des
+      nfc: toit-nfc
+  toit-nfc:
+    path: ../../toit-nfc

@@ -1,0 +1,7 @@
+name: des-fire
+description: MIFARE DESFire (EV0/EV1 legacy DES/3DES) on top of toit-nfc's ISO-DEP layer and toit-des.
+dependencies:
+  nfc:
+    path: ../toit-nfc
+  des:
+    path: ../toit-des

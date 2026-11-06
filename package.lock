@@ -1,0 +1,8 @@
+prefixes:
+  des: toit-des
+  nfc: toit-nfc
+packages:
+  toit-des:
+    path: ../toit-des
+  toit-nfc:
+    path: ../toit-nfc
