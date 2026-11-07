@@ -3,6 +3,7 @@
 // be found in the TESTS_LICENSE file.
 
 import expect show *
+import crypto.crc show crc-a
 import des show Des TripleDes BlockCipher cbc-encrypt cbc-decrypt
 import nfc.reader show Target
 import nfc.iso-dep show IsoDepCard
@@ -20,6 +21,10 @@ main:
   test-read-missing-file-throws
   test-get-file-settings
   test-exception-decoding
+  test-maced-write-read-round-trip
+  test-enciphered-write-read-round-trip
+  test-maced-write-rejected-without-authentication
+  test-maced-read-detects-tampering
 
 test-get-version-chaining:
   fake := FakeDesFirePicc
@@ -104,6 +109,52 @@ test-exception-decoding:
   expect-equals "DesFireException(FILE_NOT_FOUND, status=0xf0)" (DesFireException DesFireException.FILE-NOT-FOUND).stringify
   expect-equals "DesFireException(UNKNOWN, status=0x99)" (DesFireException 0x99).stringify
 
+test-maced-write-read-round-trip:
+  key := ByteArray 16: it
+  fake := FakeDesFirePicc
+  fake.key = key
+  card := DesFireCard (IsoDepCard fake)
+  card.authenticate --key-number=0 --key=key
+  card.create-standard-data-file 3 --size=16 --communication-settings=DesFireCard.COMMUNICATION-MACED
+  data := #[1, 2, 3, 4, 5, 6, 7, 8]
+  card.write-data 3 data --offset=2 --communication-settings=DesFireCard.COMMUNICATION-MACED
+  read-back := card.read-data 3 --offset=2 --size=data.size --communication-settings=DesFireCard.COMMUNICATION-MACED
+  expect-bytes-equal data read-back
+
+test-enciphered-write-read-round-trip:
+  key := ByteArray 8: it
+  fake := FakeDesFirePicc
+  fake.key = key
+  card := DesFireCard (IsoDepCard fake)
+  card.authenticate --key-number=0 --key=key
+  card.create-standard-data-file 4 --size=16 --communication-settings=DesFireCard.COMMUNICATION-ENCIPHERED
+  data := #[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22]
+  card.write-data 4 data --offset=1 --communication-settings=DesFireCard.COMMUNICATION-ENCIPHERED
+  read-back := card.read-data 4 --offset=1 --size=data.size --communication-settings=DesFireCard.COMMUNICATION-ENCIPHERED
+  expect-bytes-equal data read-back
+
+test-maced-write-rejected-without-authentication:
+  fake := FakeDesFirePicc
+  card := DesFireCard (IsoDepCard fake)
+  exception := catch: card.write-data 3 #[1, 2, 3] --communication-settings=DesFireCard.COMMUNICATION-MACED
+  expect-equals "DESFIRE_NOT_AUTHENTICATED" exception
+
+test-maced-read-detects-tampering:
+  // Deliberate corruption: a file declared Plain but read back as if it
+  // were MACed won't have a real trailing MAC, so the (wrong) 4 trailing
+  // data bytes used as a "MAC" should essentially never match -- proving
+  // $DesFireCard.read-data actually checks the MAC rather than passing
+  // data through unconditionally.
+  key := ByteArray 16: it
+  fake := FakeDesFirePicc
+  fake.key = key
+  card := DesFireCard (IsoDepCard fake)
+  card.authenticate --key-number=0 --key=key
+  card.create-standard-data-file 6 --size=16 --communication-settings=DesFireCard.COMMUNICATION-PLAIN
+  card.write-data 6 #[1, 2, 3, 4, 5, 6, 7, 8] --offset=0
+  exception := catch: card.read-data 6 --offset=0 --size=8 --communication-settings=DesFireCard.COMMUNICATION-MACED
+  expect-equals "DESFIRE_AUTH_FAILED" exception
+
 /**
 Plays the PICC side of DESFire's native command set (just enough to
   exercise $DesFireCard: version/AID/file enumeration, the legacy
@@ -124,6 +175,7 @@ class FakeDesFirePicc implements Target:
   rnd-b_/ByteArray? := null
   encrypted-rnd-b_/ByteArray? := null
   auth-cipher_/BlockCipher? := null
+  session-key_/BlockCipher? := null
 
   uid -> ByteArray: return #[0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
   type -> int: return 0
@@ -191,7 +243,8 @@ class FakeDesFirePicc implements Target:
       if not file: return #[0xF0]
       offset := data[1] | (data[2] << 8) | (data[3] << 16)
       size := data[4] | (data[5] << 8) | (data[6] << 16)
-      return file["data"][offset .. offset + size] + #[0x00]
+      raw := file["data"][offset .. offset + size]
+      return (protect_ raw --communication-settings=file["communication-settings"]) + #[0x00]
     if code == 0x3D:
       file-id := data[0]
       file := files_.get file-id
@@ -199,10 +252,47 @@ class FakeDesFirePicc implements Target:
       offset := data[1] | (data[2] << 8) | (data[3] << 16)
       size := data[4] | (data[5] << 8) | (data[6] << 16)
       payload := data[7 ..]
+      plain := unprotect_ payload --communication-settings=file["communication-settings"] --plain-size=size
       stored := file["data"]
-      stored.replace offset payload[.. size]
+      stored.replace offset plain
       return #[0x00]
     throw "Unhandled native command in fake: 0x$(%02x code)"
+
+  /** Mirrors $DesFireCard's own MACing/enciphering, independently, for outgoing (PICC-to-PCD) data. */
+  protect_ data/ByteArray --communication-settings/int -> ByteArray:
+    if communication-settings == 0x01: return data + (mac_ data) // MACed.
+    if communication-settings == 0x03: // Enciphered.
+      crc := crc-a data
+      with-crc := data + #[crc & 0xFF, (crc >> 8) & 0xFF]
+      padded := with-crc + (ByteArray (round-up_ with-crc.size 8) - with-crc.size)
+      return cbc-encrypt session-key_ padded
+    return data // Plain.
+
+  /** Mirrors $DesFireCard's own MAC/encryption checking, independently, for incoming (PCD-to-PICC) data. */
+  unprotect_ payload/ByteArray --communication-settings/int --plain-size/int -> ByteArray:
+    if communication-settings == 0x01: // MACed.
+      plain := payload[.. plain-size]
+      received-mac := payload[plain-size ..]
+      if received-mac != (mac_ plain): throw "FAKE_MAC_MISMATCH"
+      return plain
+    if communication-settings == 0x03: // Enciphered.
+      decrypted := cbc-decrypt session-key_ payload
+      plain := decrypted[.. plain-size]
+      crc := crc-a plain
+      if decrypted[plain-size] != crc & 0xFF or decrypted[plain-size + 1] != (crc >> 8) & 0xFF:
+        throw "FAKE_CRC_MISMATCH"
+      return plain
+    return payload[.. plain-size] // Plain.
+
+  mac_ data/ByteArray -> ByteArray:
+    padded := data + (ByteArray (round-up_ data.size 8) - data.size)
+    encrypted := cbc-encrypt session-key_ padded
+    return encrypted[encrypted.size - 8 .. encrypted.size - 4]
+
+  round-up_ value/int multiple/int -> int:
+    remainder := value % multiple
+    if remainder == 0: return value
+    return value + multiple - remainder
 
   chain_ bytes/ByteArray -> ByteArray:
     // Splits into 3 roughly-equal chained frames, matching GetVersion's
@@ -238,4 +328,9 @@ class FakeDesFirePicc implements Target:
 
     rnd-a-rotated := rnd-a[1 ..] + rnd-a[.. 1]
     encrypted := cbc-encrypt cipher rnd-a-rotated --iv=data[8 .. 16]
+
+    session-key_ = key.size == 8
+        ? (Des --key=(rnd-a[.. 4] + rnd-b_[.. 4]))
+        : (TripleDes --key=(rnd-a[.. 4] + rnd-b_[.. 4] + rnd-a[4 ..] + rnd-b_[4 ..]))
+
     return encrypted + #[0x00]

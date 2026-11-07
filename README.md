@@ -21,13 +21,6 @@ schemes DESFire also supports:
 - **AES authentication** (`0xAA`) and the separate ISO/3K3DES scheme
   (`0x1A`) — EV1-and-up alternatives to the legacy scheme this package
   implements.
-- **Secure messaging.** `authenticate` runs the full mutual-authentication
-  handshake and derives a session key, but nothing in this package uses
-  that key yet to MAC or encrypt subsequent commands (DESFire's "MACed"/
-  "Enciphered" communication settings). `read-data`/`write-data` only
-  work against files configured for "Plain" communication, which don't
-  need it. This is the natural next piece to build on top of what's
-  here.
 
 ## What's implemented
 
@@ -37,6 +30,13 @@ the legacy `Authenticate`, `GetFileIDs`, `GetFileSettings`,
 `CreateStdDataFile`, `DeleteFile`, `ReadData`, `WriteData`, and decoding
 for every documented native status byte (`DesFireException`).
 
+`ReadData`/`WriteData` support all three legacy communication settings
+a file can be configured with: Plain, MACed (a 4-byte CBC-MAC appended
+to the data), and Enciphered (the data CBC-encrypted with a trailing
+CRC16) — both using the session key `authenticate` derives, with a zero
+IV per command (legacy DES/2K3DES secure messaging doesn't chain the IV
+across commands the way EV1-and-up's AES/ISO-3K3DES CommMode does).
+
 ## On confidence
 
 The authentication handshake (the three-pass RndA/RndB exchange with
@@ -45,15 +45,22 @@ Ultralight C's — see
 [toit-mifare-ultralight](https://github.com/milkmansson/toit-mifare-ultralight#status)
 — and is checked the same way: by simulating the full PICC side of the
 exchange with real shared-key crypto, including a wrong-key case. The
-one piece that check can't reach is the **session-key derivation
-formula** (`RndA[0:4] + RndB[0:4] + RndA[4:8] + RndB[4:8]` for a 2K3DES
-key): while researching it, found one source directly describing this
-formula and other sources disputing it without a clear resolution either
-way, and since nothing in this package consumes the derived session key
-yet (see "Secure messaging" above), there's no way to test it against an
-independent oracle right now. This is the first thing to verify once
-secure messaging is built and there's a real card to test the whole
-chain against.
+**session-key derivation formula** (`RndA[0:4] + RndB[0:4] + RndA[4:8] +
+RndB[4:8]` for a 2K3DES key) is one piece that check alone can't fully
+confirm: while researching it, found one source directly describing
+this formula and other sources disputing it without a clear resolution
+either way. The secure-messaging tests now exercise it indirectly (the
+fake PICC derives the same session key independently and uses it for
+its own MAC/encryption checks, so a wrong formula on either side would
+break the round trip), but that only proves self-consistency, not that
+it matches what a real DESFire chip does.
+
+Secure messaging's own wire format (MAC and encrypted-data layout,
+zero-padding, CRC16 scope) is implemented and self-consistency-checked
+the same way — the fake PICC performs the same MACing/enciphering
+independently rather than just echoing bytes back — but, like the
+session-key formula above, this doesn't confirm it matches a real
+card's exact byte-for-byte behavior.
 
 The native command set's exact command/status byte values are from
 widely-published reference tables (shared across many independent

@@ -2,6 +2,7 @@
 // Use of this source code is governed by an MIT-style license that can be
 // found in the LICENSE file.
 
+import crypto.crc show crc-a
 import des show Des TripleDes BlockCipher cbc-encrypt cbc-decrypt
 import nfc.iso-dep show IsoDepCard
 
@@ -19,15 +20,27 @@ Only the legacy DES/2K3DES authentication scheme (command 0x0A) is
   EV1 and up also support, not needed for EV0-era cards or basic EV1
   use with the PICC master key's default cipher.
 
-Secure messaging — using the session key $authenticate derives to MAC
-  or encrypt subsequent commands (DESFire's "MACed"/"Enciphered"
-  communication settings) — is not implemented. $read-data and
-  $write-data only work against files configured for "Plain"
-  communication, which don't need it.
+$read-data and $write-data support all three legacy communication
+  settings a file can be configured with: Plain, MACed, and Enciphered
+  (DESFire's native/legacy scheme, not the AES/ISO-3K3DES CommMode used
+  by EV1-and-up's newer authentication methods). MACed communication
+  appends a 4-byte CBC-MAC (session key, zero IV) to outgoing data and
+  checks one on incoming data; Enciphered communication CBC-encrypts
+  (session key, zero IV) outgoing data with a trailing CRC16, and
+  decrypts incoming data the same way. Only the data portion of a
+  command is protected, matching DESFire's own split between a
+  command's (plain) header and its (optionally protected) data.
 */
 class DesFireCard:
   static ADDITIONAL-FRAME_ ::= 0xAF
   static OPERATION-OK_ ::= 0x00
+
+  /** No MAC or encryption; see $read-data and $write-data. */
+  static COMMUNICATION-PLAIN ::= 0x00
+  /** A 4-byte CBC-MAC is appended to the data; see $read-data and $write-data. */
+  static COMMUNICATION-MACED ::= 0x01
+  /** The data is CBC-encrypted with a trailing CRC16; see $read-data and $write-data. */
+  static COMMUNICATION-ENCIPHERED ::= 0x03
 
   static GET-VERSION_ ::= 0x60
   static GET-APPLICATION-IDS_ ::= 0x6A
@@ -124,27 +137,79 @@ class DesFireCard:
   /**
   Reads $size bytes starting at $offset from $file-id.
 
-  Only works for a file whose communication settings are "Plain" (see
-    $create-standard-data-file); this does not implement the
-    MACed/enciphered communication secure messaging would need.
+  $communication-settings must match the file's own setting (see
+    $create-standard-data-file and $get-file-settings); it determines
+    whether the response's data is protected by a MAC or encryption
+    that needs to be checked/removed, both of which need a current
+    session key (see $authenticate).
   */
-  read-data file-id/int --offset/int=0 --size/int -> ByteArray:
+  read-data file-id/int --offset/int=0 --size/int --communication-settings/int=COMMUNICATION-PLAIN -> ByteArray:
     bytes := #[
       file-id,
       offset & 0xFF, (offset >> 8) & 0xFF, (offset >> 16) & 0xFF,
       size & 0xFF, (size >> 8) & 0xFF, (size >> 16) & 0xFF,
     ]
-    return command_ READ-DATA_ bytes
+    response := command_ READ-DATA_ bytes
+    if communication-settings == COMMUNICATION-PLAIN: return response
+    if communication-settings == COMMUNICATION-MACED: return unmac-response_ response
+    if communication-settings == COMMUNICATION-ENCIPHERED: return decrypt-response_ response --plain-size=size
+    throw "INVALID_ARGUMENT"
 
-  /** Writes $data at $offset to $file-id. See $read-data for the "Plain" communication-settings restriction. */
-  write-data file-id/int data/ByteArray --offset/int=0 -> none:
+  /** Writes $data at $offset to $file-id. See $read-data for $communication-settings. */
+  write-data file-id/int data/ByteArray --offset/int=0 --communication-settings/int=COMMUNICATION-PLAIN -> none:
     size := data.size
     header := #[
       file-id,
       offset & 0xFF, (offset >> 8) & 0xFF, (offset >> 16) & 0xFF,
       size & 0xFF, (size >> 8) & 0xFF, (size >> 16) & 0xFF,
     ]
-    command_ WRITE-DATA_ (header + data)
+    protected-data := data
+    if communication-settings == COMMUNICATION-MACED:
+      protected-data = data + (mac_ data)
+    else if communication-settings == COMMUNICATION-ENCIPHERED:
+      protected-data = encrypt-data_ data
+    else if communication-settings != COMMUNICATION-PLAIN:
+      throw "INVALID_ARGUMENT"
+    command_ WRITE-DATA_ (header + protected-data)
+
+  /** Computes the 4-byte CBC-MAC (session key, zero IV) over $data. */
+  mac_ data/ByteArray -> ByteArray:
+    if not session-key_: throw "DESFIRE_NOT_AUTHENTICATED"
+    padded := data + (ByteArray (round-up_ data.size 8) - data.size)
+    encrypted := cbc-encrypt session-key_ padded
+    return encrypted[encrypted.size - 8 .. encrypted.size - 4]
+
+  /** Checks and strips the trailing 4-byte CBC-MAC from a $response. */
+  unmac-response_ response/ByteArray -> ByteArray:
+    if response.size < 4: throw "DESFIRE_AUTH_FAILED"
+    data := response[.. response.size - 4]
+    received-mac := response[response.size - 4 ..]
+    if received-mac != (mac_ data): throw "DESFIRE_AUTH_FAILED"
+    return data
+
+  /** Encrypts $data (session key, zero IV), appending a CRC16 and zero-padding to a multiple of 8 bytes first. */
+  encrypt-data_ data/ByteArray -> ByteArray:
+    if not session-key_: throw "DESFIRE_NOT_AUTHENTICATED"
+    crc := crc-a data
+    with-crc := data + #[crc & 0xFF, (crc >> 8) & 0xFF]
+    padded := with-crc + (ByteArray (round-up_ with-crc.size 8) - with-crc.size)
+    return cbc-encrypt session-key_ padded
+
+  /** Decrypts an Enciphered $response (session key, zero IV), checking the trailing CRC16 and returning the $plain-size data bytes. */
+  decrypt-response_ response/ByteArray --plain-size/int -> ByteArray:
+    if not session-key_: throw "DESFIRE_NOT_AUTHENTICATED"
+    decrypted := cbc-decrypt session-key_ response
+    if decrypted.size < plain-size + 2: throw "DESFIRE_AUTH_FAILED"
+    data := decrypted[.. plain-size]
+    crc := crc-a data
+    if decrypted[plain-size] != crc & 0xFF or decrypted[plain-size + 1] != (crc >> 8) & 0xFF:
+      throw "DESFIRE_AUTH_FAILED"
+    return data
+
+  static round-up_ value/int multiple/int -> int:
+    remainder := value % multiple
+    if remainder == 0: return value
+    return value + multiple - remainder
 
   /**
   Authenticates with $key-number using DESFire's legacy DES/2K3DES
