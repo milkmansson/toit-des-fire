@@ -59,12 +59,10 @@ AES-KEY/ByteArray? := null
 RUN-WRITE-TESTS := false
 
 main:
-  sda := gpio.Pin SDA
-  scl := gpio.Pin SCL
-  irq := IRQ-PIN and (gpio.Pin IRQ-PIN)
-  reset := RESET-PIN and (gpio.Pin RESET-PIN)
+  irq := IRQ-PIN and (gpio.Pin.in IRQ-PIN)
+  reset := RESET-PIN and (gpio.Pin.out RESET-PIN)
 
-  bus := i2c.Bus --sda=sda --scl=scl --frequency=100_000
+  bus := i2c.Bus --sda=SDA --scl=SCL --frequency=100_000
   device := bus.device Pn53x.I2C-ADDRESS
   pn53x := Pn53x.i2c device --irq=irq --reset=reset
 
@@ -114,8 +112,6 @@ main:
   bus.close
   if irq: irq.close
   if reset: reset.close
-  scl.close
-  sda.close
 
 run-write-tests_ card/DesFireCard -> none:
   aid := 0x00AABB
