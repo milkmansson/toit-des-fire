@@ -2,35 +2,110 @@
 // Use of this source code is governed by an MIT-style license that can be
 // found in the LICENSE file.
 
+import crypto.aes show AesEcb
 import crypto.crc show crc-a
-import des show Des TripleDes BlockCipher cbc-encrypt cbc-decrypt
+import des show Des TripleDes BlockCipher
 import nfc.iso-dep show IsoDepCard
 
 /**
-MIFARE DESFire's legacy DES/3DES native command set, on top of
-  $IsoDepCard and `toit-des`.
+MIFARE DESFire's native command set, on top of $IsoDepCard and
+  `toit-des`.
 
 Only "native" command framing is implemented (the command byte and its
   parameters go straight into the ISO-DEP APDU); ISO 7816-4-wrapped mode
   (where commands are sent as standard CLA/INS/P1/P2 APDUs) is not.
 
-Only the legacy DES/2K3DES authentication scheme (command 0x0A) is
-  implemented, not AES authentication (0xAA) or the separate ISO/3K3DES
-  scheme (0x1A) — both of those are later/alternative schemes DESFire
-  EV1 and up also support, not needed for EV0-era cards or basic EV1
-  use with the PICC master key's default cipher.
+Three authentication schemes are implemented, all the same three-pass
+  ISO/IEC 9798-2 mutual authentication structure (the same family as
+  MIFARE Ultralight C's — see `toit-mifare-ultralight` — plus a
+  session-key derivation step at the end): $DesFireCard.authenticate
+  (command `0x0A`, legacy DES/2K3DES, an 8-byte nonce/block size),
+  $DesFireCard.authenticate-iso (command `0x1A`, ISO 3K3DES, also an
+  8-byte nonce/block size), and $DesFireCard.authenticate-aes (command
+  `0xAA`, AES-128, a 16-byte nonce/block size).
 
-$read-data and $write-data support all three legacy communication
-  settings a file can be configured with: Plain, MACed, and Enciphered
-  (DESFire's native/legacy scheme, not the AES/ISO-3K3DES CommMode used
-  by EV1-and-up's newer authentication methods). MACed communication
-  appends a 4-byte CBC-MAC (session key, zero IV) to outgoing data and
-  checks one on incoming data; Enciphered communication CBC-encrypts
-  (session key, zero IV) outgoing data with a trailing CRC16, and
-  decrypts incoming data the same way. Only the data portion of a
-  command is protected, matching DESFire's own split between a
-  command's (plain) header and its (optionally protected) data.
+$DesFireCard.read-data and $DesFireCard.write-data support DESFire's
+  legacy MACed/Enciphered communication settings (a CBC-MAC — session
+  key, zero IV — appended to outgoing data and checked on incoming
+  data; or CBC encryption — session key, zero IV — with a trailing
+  CRC16, in both directions). Only the data portion of a command is
+  protected, matching DESFire's own split between a command's (plain)
+  header and its (optionally protected) data. This is expressed
+  generically over $SessionCipher_ so it runs with a session key from
+  any of the three authentication methods above, not just DES/3DES's
+  — but it's still the *legacy* MAC/encryption scheme specifically.
+  DESFire EV1's own secure messaging under AES authentication actually
+  uses AES-CMAC (not plain CBC-MAC) and its own enciphering convention;
+  $DesFireCard.authenticate-aes's session key isn't paired with a
+  matching CMAC-based implementation here, so treat
+  $DesFireCard.read-data/$DesFireCard.write-data's protected modes as
+  verified self-consistent for legacy/ISO sessions only.
 */
+
+/**
+A single-block cipher primitive, abstracting over $BlockCipher's 8-byte
+  DES/3DES blocks ($DesFamilySessionCipher_) and AES's 16-byte blocks
+  ($AesSessionCipher_), so authentication and secure messaging can
+  share one CBC implementation ($cbc-encrypt_, $cbc-decrypt_) regardless
+  of which scheme produced the session key.
+*/
+interface SessionCipher_:
+  block-size -> int
+  encrypt-block block/ByteArray -> ByteArray
+  decrypt-block block/ByteArray -> ByteArray
+
+class DesFamilySessionCipher_ implements SessionCipher_:
+  cipher_/BlockCipher
+  constructor .cipher_:
+  block-size -> int: return 8
+  encrypt-block block/ByteArray -> ByteArray: return cipher_.encrypt block
+  decrypt-block block/ByteArray -> ByteArray: return cipher_.decrypt block
+
+class AesSessionCipher_ implements SessionCipher_:
+  key_/ByteArray
+  constructor .key_:
+  block-size -> int: return 16
+  encrypt-block block/ByteArray -> ByteArray:
+    encryptor := AesEcb.encryptor key_
+    try:
+      return encryptor.encrypt block
+    finally:
+      encryptor.close
+  decrypt-block block/ByteArray -> ByteArray:
+    decryptor := AesEcb.decryptor key_
+    try:
+      return decryptor.decrypt block
+    finally:
+      decryptor.close
+
+/** Encrypts $data (a multiple of $cipher's block size) with $cipher in CBC mode. */
+cbc-encrypt_ cipher/SessionCipher_ data/ByteArray --iv/ByteArray -> ByteArray:
+  block-size := cipher.block-size
+  if data.size % block-size != 0: throw "INVALID_ARGUMENT"
+  result := ByteArray data.size
+  previous := iv
+  for i := 0; i < data.size; i += block-size:
+    plain := data[i .. i + block-size]
+    xored := ByteArray block-size: plain[it] ^ previous[it]
+    encrypted := cipher.encrypt-block xored
+    result.replace i encrypted
+    previous = encrypted
+  return result
+
+/** Decrypts $data (a multiple of $cipher's block size) with $cipher in CBC mode. See $cbc-encrypt_. */
+cbc-decrypt_ cipher/SessionCipher_ data/ByteArray --iv/ByteArray -> ByteArray:
+  block-size := cipher.block-size
+  if data.size % block-size != 0: throw "INVALID_ARGUMENT"
+  result := ByteArray data.size
+  previous := iv
+  for i := 0; i < data.size; i += block-size:
+    ciphertext := data[i .. i + block-size]
+    decrypted := cipher.decrypt-block ciphertext
+    plain := ByteArray block-size: decrypted[it] ^ previous[it]
+    result.replace i plain
+    previous = ciphertext
+  return result
+
 class DesFireCard:
   static ADDITIONAL-FRAME_ ::= 0xAF
   static OPERATION-OK_ ::= 0x00
@@ -50,6 +125,8 @@ class DesFireCard:
   static FORMAT-PICC_ ::= 0xFC
   static FREE-MEMORY_ ::= 0x6E
   static AUTHENTICATE-LEGACY_ ::= 0x0A
+  static AUTHENTICATE-ISO_ ::= 0x1A
+  static AUTHENTICATE-AES_ ::= 0xAA
   static GET-FILE-IDS_ ::= 0x6F
   static GET-FILE-SETTINGS_ ::= 0xF5
   static CREATE-STD-DATA-FILE_ ::= 0xCD
@@ -58,7 +135,7 @@ class DesFireCard:
   static WRITE-DATA_ ::= 0x3D
 
   target_/IsoDepCard
-  session-key_/BlockCipher? := null
+  session-key_/SessionCipher_? := null
 
   constructor .target_:
 
@@ -172,12 +249,13 @@ class DesFireCard:
       throw "INVALID_ARGUMENT"
     command_ WRITE-DATA_ (header + protected-data)
 
-  /** Computes the 4-byte CBC-MAC (session key, zero IV) over $data. */
+  /** Computes the CBC-MAC (session key, zero IV) over $data, truncated to 4 bytes. */
   mac_ data/ByteArray -> ByteArray:
     if not session-key_: throw "DESFIRE_NOT_AUTHENTICATED"
-    padded := data + (ByteArray (round-up_ data.size 8) - data.size)
-    encrypted := cbc-encrypt session-key_ padded
-    return encrypted[encrypted.size - 8 .. encrypted.size - 4]
+    block-size := session-key_.block-size
+    padded := data + (ByteArray (round-up_ data.size block-size) - data.size)
+    encrypted := cbc-encrypt_ session-key_ padded --iv=(ByteArray block-size)
+    return encrypted[encrypted.size - block-size .. encrypted.size - block-size + 4]
 
   /** Checks and strips the trailing 4-byte CBC-MAC from a $response. */
   unmac-response_ response/ByteArray -> ByteArray:
@@ -187,18 +265,18 @@ class DesFireCard:
     if received-mac != (mac_ data): throw "DESFIRE_AUTH_FAILED"
     return data
 
-  /** Encrypts $data (session key, zero IV), appending a CRC16 and zero-padding to a multiple of 8 bytes first. */
+  /** Encrypts $data (session key, zero IV), appending a CRC16 and zero-padding to a multiple of the session cipher's block size first. */
   encrypt-data_ data/ByteArray -> ByteArray:
     if not session-key_: throw "DESFIRE_NOT_AUTHENTICATED"
     crc := crc-a data
     with-crc := data + #[crc & 0xFF, (crc >> 8) & 0xFF]
-    padded := with-crc + (ByteArray (round-up_ with-crc.size 8) - with-crc.size)
-    return cbc-encrypt session-key_ padded
+    padded := with-crc + (ByteArray (round-up_ with-crc.size session-key_.block-size) - with-crc.size)
+    return cbc-encrypt_ session-key_ padded --iv=(ByteArray session-key_.block-size)
 
   /** Decrypts an Enciphered $response (session key, zero IV), checking the trailing CRC16 and returning the $plain-size data bytes. */
   decrypt-response_ response/ByteArray --plain-size/int -> ByteArray:
     if not session-key_: throw "DESFIRE_NOT_AUTHENTICATED"
-    decrypted := cbc-decrypt session-key_ response
+    decrypted := cbc-decrypt_ session-key_ response --iv=(ByteArray session-key_.block-size)
     if decrypted.size < plain-size + 2: throw "DESFIRE_AUTH_FAILED"
     data := decrypted[.. plain-size]
     crc := crc-a data
@@ -213,42 +291,84 @@ class DesFireCard:
 
   /**
   Authenticates with $key-number using DESFire's legacy DES/2K3DES
-    scheme: an ISO/IEC 9798-2 three-pass mutual authentication, the same
-    family as MIFARE Ultralight C's (see `toit-mifare-ultralight`), but
-    with an added session-key derivation step at the end, since DESFire
-    (unlike Ultralight C) uses the session key to protect later commands
-    — once secure messaging is implemented; see this class's doc
-    comment for what $authenticate itself does and doesn't enable yet.
+    scheme. See this class's doc comment for the shared three-pass
+    structure, and $read-data/$write-data for what the resulting
+    session key enables.
 
   $key must be 8 bytes (single DES) or 16 bytes (2-key 3DES).
   */
   authenticate --key-number/int --key/ByteArray -> none:
     if key.size != 8 and key.size != 16: throw "INVALID_ARGUMENT"
-    cipher/BlockCipher := key.size == 8 ? (Des --key=key) : (TripleDes --key=key)
+    block-cipher/BlockCipher := key.size == 8 ? (Des --key=key) : (TripleDes --key=key)
+    session-key_ = authenticate-generic_ AUTHENTICATE-LEGACY_ key-number (DesFamilySessionCipher_ block-cipher)
+        --derive-session-key=:: | rnd-a/ByteArray rnd-b/ByteArray |
+          DesFamilySessionCipher_ (key.size == 8
+              ? (Des --key=(rnd-a[.. 4] + rnd-b[.. 4]))
+              : (TripleDes --key=(rnd-a[.. 4] + rnd-b[.. 4] + rnd-a[4 ..] + rnd-b[4 ..])))
 
-    step1 := unwrap-single-frame_ (target_.transceive #[AUTHENTICATE-LEGACY_, key-number]) --expect-status=ADDITIONAL-FRAME_
-    if step1.size != 8: throw "DESFIRE_AUTH_FAILED"
+  /**
+  Authenticates with $key-number using DESFire's ISO authentication
+    scheme (3-key 3DES, also known as 3K3DES). See this class's doc
+    comment for the shared three-pass structure, and
+    $read-data/$write-data for what the resulting session key enables.
+
+  $key must be 24 bytes.
+  */
+  authenticate-iso --key-number/int --key/ByteArray -> none:
+    if key.size != 24: throw "INVALID_ARGUMENT"
+    session-key_ = authenticate-generic_ AUTHENTICATE-ISO_ key-number (DesFamilySessionCipher_ (TripleDes --key=key))
+        --derive-session-key=:: | rnd-a/ByteArray rnd-b/ByteArray |
+          key-material := rnd-a[.. 4] + rnd-b[.. 4] + rnd-a[.. 4] + rnd-b[.. 4] + rnd-a[4 ..] + rnd-b[4 ..]
+          DesFamilySessionCipher_ (TripleDes --key=key-material)
+
+  /**
+  Authenticates with $key-number using DESFire EV1's AES authentication
+    scheme. See this class's doc comment for the shared three-pass
+    structure (here with a 16-byte AES block as the nonce/block size,
+    rather than DES/3DES's 8 bytes), and $read-data/$write-data for
+    what the resulting session key enables.
+
+  $key must be 16 bytes (AES-128).
+  */
+  authenticate-aes --key-number/int --key/ByteArray -> none:
+    if key.size != 16: throw "INVALID_ARGUMENT"
+    session-key_ = authenticate-generic_ AUTHENTICATE-AES_ key-number (AesSessionCipher_ key)
+        --derive-session-key=:: | rnd-a/ByteArray rnd-b/ByteArray |
+          AesSessionCipher_ (rnd-a[.. 4] + rnd-b[.. 4] + rnd-a[12 ..] + rnd-b[12 ..])
+
+  /**
+  Runs the three-pass mutual-authentication handshake shared by
+    $authenticate, $authenticate-iso, and $authenticate-aes: the PICC
+    sends an encrypted nonce (RndB); the PCD decrypts it, generates its
+    own nonce (RndA), and replies with RndA followed by a rotated RndB,
+    both encrypted, chained from the PICC's own ciphertext; the PICC
+    replies with a rotated, re-encrypted RndA, which the PCD checks
+    against its own RndA to confirm the PICC also holds the key.
+
+  $derive-session-key computes the resulting session key from the two
+    nonces, since the derivation formula differs per scheme.
+  */
+  authenticate-generic_ command/int key-number/int cipher/SessionCipher_ --derive-session-key/Lambda -> SessionCipher_:
+    nonce-size := cipher.block-size
+
+    step1 := unwrap-single-frame_ (target_.transceive #[command, key-number]) --expect-status=ADDITIONAL-FRAME_
+    if step1.size != nonce-size: throw "DESFIRE_AUTH_FAILED"
     encrypted-rnd-b := step1
-    rnd-b := cbc-decrypt cipher encrypted-rnd-b
+    rnd-b := cbc-decrypt_ cipher encrypted-rnd-b --iv=(ByteArray nonce-size)
 
-    rnd-a := ByteArray 8: random 0x100
+    rnd-a := ByteArray nonce-size: random 0x100
     rnd-b-rotated := rnd-b[1 ..] + rnd-b[.. 1]
     plain := rnd-a + rnd-b-rotated
-    encrypted := cbc-encrypt cipher plain --iv=encrypted-rnd-b
+    encrypted := cbc-encrypt_ cipher plain --iv=encrypted-rnd-b
 
     step2 := unwrap-single-frame_ (target_.transceive (#[ADDITIONAL-FRAME_] + encrypted)) --expect-status=OPERATION-OK_
-    if step2.size != 8: throw "DESFIRE_AUTH_FAILED"
+    if step2.size != nonce-size: throw "DESFIRE_AUTH_FAILED"
 
-    rnd-a-rotated := cbc-decrypt cipher step2 --iv=encrypted[8 .. 16]
+    rnd-a-rotated := cbc-decrypt_ cipher step2 --iv=encrypted[encrypted.size - nonce-size ..]
     expected-rnd-a-rotated := rnd-a[1 ..] + rnd-a[.. 1]
     if rnd-a-rotated != expected-rnd-a-rotated: throw "DESFIRE_AUTH_FAILED"
 
-    session-key_ = derive-session-key_ key.size rnd-a rnd-b
-
-  static derive-session-key_ key-size/int rnd-a/ByteArray rnd-b/ByteArray -> BlockCipher:
-    if key-size == 8:
-      return Des --key=(rnd-a[.. 4] + rnd-b[.. 4])
-    return TripleDes --key=(rnd-a[.. 4] + rnd-b[.. 4] + rnd-a[4 ..] + rnd-b[4 ..])
+    return derive-session-key.call rnd-a rnd-b
 
   unwrap-single-frame_ response/ByteArray? --expect-status/int -> ByteArray:
     if not response or response.is-empty: throw "DESFIRE_NO_RESPONSE"

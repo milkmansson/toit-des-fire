@@ -3,6 +3,7 @@
 // be found in the TESTS_LICENSE file.
 
 import expect show *
+import crypto.aes show AesEcb
 import crypto.crc show crc-a
 import des show Des TripleDes BlockCipher cbc-encrypt cbc-decrypt
 import nfc.reader show Target
@@ -25,6 +26,10 @@ main:
   test-enciphered-write-read-round-trip
   test-maced-write-rejected-without-authentication
   test-maced-read-detects-tampering
+  test-authenticate-iso-succeeds
+  test-authenticate-iso-fails-with-wrong-key
+  test-authenticate-aes-succeeds
+  test-authenticate-aes-fails-with-wrong-key
 
 test-get-version-chaining:
   fake := FakeDesFirePicc
@@ -155,6 +160,102 @@ test-maced-read-detects-tampering:
   exception := catch: card.read-data 6 --offset=0 --size=8 --communication-settings=DesFireCard.COMMUNICATION-MACED
   expect-equals "DESFIRE_AUTH_FAILED" exception
 
+test-authenticate-iso-succeeds:
+  key := ByteArray 24: it
+  fake := FakeDesFirePicc
+  fake.key = key
+  card := DesFireCard (IsoDepCard fake)
+  expect-not card.is-authenticated
+  card.authenticate-iso --key-number=0 --key=key
+  expect card.is-authenticated
+
+test-authenticate-iso-fails-with-wrong-key:
+  key := ByteArray 24: it
+  wrong-key := ByteArray 24: 0xFF
+  fake := FakeDesFirePicc
+  fake.key = key
+  card := DesFireCard (IsoDepCard fake)
+  exception := catch: card.authenticate-iso --key-number=0 --key=wrong-key
+  expect-equals DesFireException.AUTHENTICATION-ERROR exception.status
+
+test-authenticate-aes-succeeds:
+  key := ByteArray 16: it
+  fake := FakeDesFirePicc
+  fake.key = key
+  card := DesFireCard (IsoDepCard fake)
+  expect-not card.is-authenticated
+  card.authenticate-aes --key-number=0 --key=key
+  expect card.is-authenticated
+
+test-authenticate-aes-fails-with-wrong-key:
+  key := ByteArray 16: it
+  wrong-key := ByteArray 16: 0xFF
+  fake := FakeDesFirePicc
+  fake.key = key
+  card := DesFireCard (IsoDepCard fake)
+  exception := catch: card.authenticate-aes --key-number=0 --key=wrong-key
+  expect-equals DesFireException.AUTHENTICATION-ERROR exception.status
+
+/**
+A single-block cipher primitive for the fake's own authentication
+  handshake, mirroring $DesFireCard's own (private, so not importable
+  here) `SessionCipher_` abstraction -- needed since the fake has to
+  independently play both DES/3DES's 8-byte-block authentication
+  schemes and AES's 16-byte-block one.
+*/
+interface FakeSessionCipher_:
+  block-size -> int
+  encrypt-block block/ByteArray -> ByteArray
+  decrypt-block block/ByteArray -> ByteArray
+
+class FakeDesFamilyCipher_ implements FakeSessionCipher_:
+  cipher_/BlockCipher
+  constructor .cipher_:
+  block-size -> int: return 8
+  encrypt-block block/ByteArray -> ByteArray: return cipher_.encrypt block
+  decrypt-block block/ByteArray -> ByteArray: return cipher_.decrypt block
+
+class FakeAesCipher_ implements FakeSessionCipher_:
+  key_/ByteArray
+  constructor .key_:
+  block-size -> int: return 16
+  encrypt-block block/ByteArray -> ByteArray:
+    encryptor := AesEcb.encryptor key_
+    try:
+      return encryptor.encrypt block
+    finally:
+      encryptor.close
+  decrypt-block block/ByteArray -> ByteArray:
+    decryptor := AesEcb.decryptor key_
+    try:
+      return decryptor.decrypt block
+    finally:
+      decryptor.close
+
+fake-cbc-encrypt_ cipher/FakeSessionCipher_ data/ByteArray --iv/ByteArray -> ByteArray:
+  block-size := cipher.block-size
+  result := ByteArray data.size
+  previous := iv
+  for i := 0; i < data.size; i += block-size:
+    plain := data[i .. i + block-size]
+    xored := ByteArray block-size: plain[it] ^ previous[it]
+    encrypted := cipher.encrypt-block xored
+    result.replace i encrypted
+    previous = encrypted
+  return result
+
+fake-cbc-decrypt_ cipher/FakeSessionCipher_ data/ByteArray --iv/ByteArray -> ByteArray:
+  block-size := cipher.block-size
+  result := ByteArray data.size
+  previous := iv
+  for i := 0; i < data.size; i += block-size:
+    ciphertext := data[i .. i + block-size]
+    decrypted := cipher.decrypt-block ciphertext
+    plain := ByteArray block-size: decrypted[it] ^ previous[it]
+    result.replace i plain
+    previous = ciphertext
+  return result
+
 /**
 Plays the PICC side of DESFire's native command set (just enough to
   exercise $DesFireCard: version/AID/file enumeration, the legacy
@@ -175,6 +276,8 @@ class FakeDesFirePicc implements Target:
   rnd-b_/ByteArray? := null
   encrypted-rnd-b_/ByteArray? := null
   auth-cipher_/BlockCipher? := null
+  auth-nonce-size_/int := 8
+  auth-fake-cipher_/FakeSessionCipher_? := null
   session-key_/BlockCipher? := null
 
   uid -> ByteArray: return #[0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
@@ -182,7 +285,10 @@ class FakeDesFirePicc implements Target:
   close -> none:
 
   transceive bytes/ByteArray --check-crc/bool=false -> ByteArray?:
-    if bytes.size == 2 and bytes[0] == 0xE0: return #[0x01] // TL-only ATS.
+    // FSCI=8 (FSC=256): large enough that even AES authentication's
+    // 32-byte step2 message fits in one I-block, so this fake doesn't
+    // need to implement incoming chaining reassembly.
+    if bytes.size == 2 and bytes[0] == 0xE0: return #[0x02, 0x08]
 
     pcb := bytes[0]
     block-type := pcb & 0xC0
@@ -207,7 +313,9 @@ class FakeDesFirePicc implements Target:
       return #[0x00]
     if code == 0x6E:
       return #[free-memory-bytes & 0xFF, (free-memory-bytes >> 8) & 0xFF, (free-memory-bytes >> 16) & 0xFF, 0x00]
-    if code == 0x0A: return authenticate-step1_ data
+    if code == 0x0A: return authenticate-step1_ data --nonce-size=8
+    if code == 0x1A: return authenticate-step1_ data --nonce-size=8
+    if code == 0xAA: return authenticate-step1_ data --nonce-size=16
     if code == 0xAF:
       if data.is-empty: return continue-chain_
       return authenticate-step2_ data
@@ -311,26 +419,31 @@ class FakeDesFirePicc implements Target:
     is-last := chaining-remainder_.is-empty
     return chunk + #[is-last ? 0x00 : 0xAF]
 
-  authenticate-step1_ data/ByteArray -> ByteArray:
-    cipher := key.size == 8 ? (Des --key=key) : (TripleDes --key=key)
-    auth-cipher_ = cipher
-    rnd-b_ = ByteArray 8: random 0x100
-    encrypted-rnd-b_ = cbc-encrypt cipher rnd-b_
+  authenticate-step1_ data/ByteArray --nonce-size/int -> ByteArray:
+    auth-nonce-size_ = nonce-size
+    auth-fake-cipher_ = nonce-size == 16 ? (FakeAesCipher_ key) : (FakeDesFamilyCipher_ (key.size == 8 ? (Des --key=key) : (TripleDes --key=key)))
+    rnd-b_ = ByteArray nonce-size: random 0x100
+    encrypted-rnd-b_ = fake-cbc-encrypt_ auth-fake-cipher_ rnd-b_ --iv=(ByteArray nonce-size)
     return encrypted-rnd-b_ + #[0xAF]
 
   authenticate-step2_ data/ByteArray -> ByteArray:
-    cipher := auth-cipher_
-    plain := cbc-decrypt cipher data --iv=encrypted-rnd-b_
-    rnd-a := plain[.. 8]
-    received-rnd-b-rotated := plain[8 ..]
+    nonce-size := auth-nonce-size_
+    cipher := auth-fake-cipher_
+    plain := fake-cbc-decrypt_ cipher data --iv=encrypted-rnd-b_
+    rnd-a := plain[.. nonce-size]
+    received-rnd-b-rotated := plain[nonce-size ..]
     expected-rnd-b-rotated := rnd-b_[1 ..] + rnd-b_[.. 1]
     if received-rnd-b-rotated != expected-rnd-b-rotated: return #[0xAE]
 
     rnd-a-rotated := rnd-a[1 ..] + rnd-a[.. 1]
-    encrypted := cbc-encrypt cipher rnd-a-rotated --iv=data[8 .. 16]
+    encrypted := fake-cbc-encrypt_ cipher rnd-a-rotated --iv=data[nonce-size .. nonce-size * 2]
 
-    session-key_ = key.size == 8
-        ? (Des --key=(rnd-a[.. 4] + rnd-b_[.. 4]))
-        : (TripleDes --key=(rnd-a[.. 4] + rnd-b_[.. 4] + rnd-a[4 ..] + rnd-b_[4 ..]))
+    // Secure-messaging tests only exercise the legacy (8-byte nonce, 8/16
+    // byte key) scheme, which is all this derives; ISO/AES sessions skip
+    // it since nothing here round-trips MACed/Enciphered data through them.
+    if nonce-size == 8 and (key.size == 8 or key.size == 16):
+      session-key_ = key.size == 8
+          ? (Des --key=(rnd-a[.. 4] + rnd-b_[.. 4]))
+          : (TripleDes --key=(rnd-a[.. 4] + rnd-b_[.. 4] + rnd-a[4 ..] + rnd-b_[4 ..]))
 
     return encrypted + #[0x00]
