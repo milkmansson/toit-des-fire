@@ -1,3 +1,7 @@
 dependencies:
   des-fire:
     path: ..
+  nfc:
+    path: ../../toit-nfc
+  pn53x:
+    path: ../../toit-pn53x

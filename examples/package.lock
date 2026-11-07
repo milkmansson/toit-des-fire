@@ -1,5 +1,7 @@
 prefixes:
   des-fire: toit-des-fire
+  nfc: toit-nfc
+  pn53x: toit-pn53x
 packages:
   toit-des:
     path: ../../toit-des
@@ -10,3 +12,7 @@ packages:
       nfc: toit-nfc
   toit-nfc:
     path: ../../toit-nfc
+  toit-pn53x:
+    path: ../../toit-pn53x
+    prefixes:
+      nfc: toit-nfc
